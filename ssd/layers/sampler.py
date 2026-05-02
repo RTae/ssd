@@ -1,39 +1,65 @@
 import torch
 from torch import nn
+import flashinfer
 
 from ssd.utils.async_helpers.async_spec_helpers import apply_sampler_x_rescaling
 
+# Monkey-patch flashinfer 0.5.2 bug: get_seed_and_offset builds state on CPU
+# but generator is on CUDA, causing TypeError: RNG state must be a torch.ByteTensor.
+import flashinfer.sampling as _fi_samp
+_orig_get_seed_and_offset = _fi_samp.get_seed_and_offset
+def _fixed_get_seed_and_offset(increment, generator=None):
+    if generator is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        generator = torch.Generator(device=device)
+    state = generator.get_state()
+    seed, offset = state.view(torch.int64)
+    offset += (increment + 3) // 4 * 4
+    new_state = torch.tensor([seed, offset], dtype=torch.int64, device=state.device).view(torch.uint8)
+    generator.set_state(new_state)
+    return int(seed), int(offset)
+_fi_samp.get_seed_and_offset = _fixed_get_seed_and_offset
+
 torch.manual_seed(0) 
 
-class Sampler(nn.Module): 
+class Sampler(nn.Module):
     def __init__(self, sampler_x: float | None = None, async_fan_out: int = 3):
         super().__init__()
         self.sampler_x = sampler_x
-        self.F = async_fan_out # will need to accomodate lists for hit/miss eventually 
-    
-    @torch.inference_mode() # what shape are logits during tree decode? MQ_LEN, 
-    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor, is_tree: bool = False):
-        # logits: [B, V], temperatures: [B]
-        
-        logits_cpy = logits.to(torch.float) 
-        greedy_tokens = logits_cpy.argmax(dim=-1)
+        self.F = async_fan_out
+        self._fi_gen = None
 
-        # Fast path: any zero temperature rows are greedy
-        temps = temperatures
-        zero_mask = temps == 0
-        
-        # Note: keep inplace ops for speed
-        logits_cpy.div_(temperatures.unsqueeze(dim=1))
-        probs = torch.softmax(logits_cpy, dim=-1, dtype=torch.float)
-        
-        # Apply sampler_x rescaling when conditions are met
+    def _get_gen(self, device):
+        if self._fi_gen is None or self._fi_gen.device != device:
+            self._fi_gen = torch.Generator(device=device)
+            self._fi_gen.manual_seed(0)
+        return self._fi_gen
+
+    @torch.inference_mode()
+    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor, is_tree: bool = False):
         if self.sampler_x is not None and is_tree:
+            logits_cpy = logits.to(torch.float)
+            greedy_tokens = logits_cpy.argmax(dim=-1)
+            zero_mask = temperatures == 0
+            logits_cpy.div_(temperatures.unsqueeze(dim=1))
+            probs = torch.softmax(logits_cpy, dim=-1, dtype=torch.float)
             probs = apply_sampler_x_rescaling(probs, self.sampler_x, self.F)
-        
-        epsilon = 1e-10
-        scores = probs.div_(torch.empty_like(probs).exponential_(1) + epsilon)
-        sample_tokens = scores.argmax(dim=-1)
-        return torch.where(zero_mask, greedy_tokens, sample_tokens)
+            epsilon = 1e-10
+            scores = probs.div_(torch.empty_like(probs).exponential_(1) + epsilon)
+            sample_tokens = scores.argmax(dim=-1)
+            return torch.where(zero_mask, greedy_tokens, sample_tokens)
+
+        zero_mask = temperatures == 0
+        safe_temps = torch.where(zero_mask, torch.ones_like(temperatures), temperatures)
+        scaled = logits.to(torch.float).div_(safe_temps.unsqueeze(-1))
+        sample_tokens = flashinfer.sampling_from_logits(
+            scaled, generator=self._get_gen(scaled.device)
+        ).to(torch.int64)
+        if zero_mask.any():
+            greedy_tokens = logits.float().argmax(dim=-1)
+            sample_tokens = torch.where(zero_mask, greedy_tokens, sample_tokens)
+        return sample_tokens
+
 
 
 def profile_sampler():
