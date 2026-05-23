@@ -115,6 +115,17 @@ class LLMEngine:
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
+
+        # VLM processor for image inputs
+        self.processor = None
+        if config.is_vlm:
+            try:
+                from transformers import AutoProcessor
+                self.processor = AutoProcessor.from_pretrained(config.model, use_fast=True)
+                print(f"[LLMEngine] VLM processor loaded from {config.model}", flush=True)
+            except Exception as e:
+                print(f"[LLMEngine] Warning: Failed to load VLM processor: {e}", flush=True)
+
         self.scheduler = Scheduler(config, draft_cfg=self.draft_cfg if config.speculate else None)
         assert config.max_model_len == self.scheduler.max_model_len
 
@@ -183,10 +194,53 @@ class LLMEngine:
         if hard:
             os._exit(0)
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        if isinstance(prompt, str):
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams,
+                    images: list | None = None):
+        """Add a generation request.
+
+        Args:
+            prompt: Text string or pre-tokenized token ids.
+            sampling_params: Sampling parameters.
+            images: Optional list of PIL Images for VLM mode. When provided,
+                    the prompt should contain image placeholders (e.g. <|image|>)
+                    and the VLM processor will handle tokenization + pixel preprocessing.
+        """
+        pixel_values = None
+        image_grid_thw = None
+        image_mask = None
+
+        if images is not None and self.processor is not None:
+            # Use VLM processor to get token ids + pixel values
+            assert isinstance(prompt, str), "VLM with images requires a text prompt"
+            processed = self.processor(
+                text=[prompt],
+                images=images,
+                return_tensors="pt",
+            )
+            prompt = processed["input_ids"][0].tolist()
+            if "pixel_values" in processed:
+                pixel_values = processed["pixel_values"]
+            if "image_grid_thw" in processed:
+                image_grid_thw = processed["image_grid_thw"]
+
+            # Build image_mask: True where token_id is the image placeholder
+            # Qwen2-VL/Qwen3-VL uses token id 151655 for <|image_pad|>
+            image_token_id = getattr(self.tokenizer, "image_token_id", None)
+            if image_token_id is None:
+                # Try common Qwen VL image pad token id
+                image_token_id = 151655
+            import torch
+            input_ids_t = torch.tensor(prompt, dtype=torch.long)
+            image_mask = input_ids_t == image_token_id
+            if not image_mask.any():
+                image_mask = None  # No image tokens found
+        elif isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
+
+        seq = Sequence(prompt, sampling_params,
+                       pixel_values=pixel_values,
+                       image_grid_thw=image_grid_thw,
+                       image_mask=image_mask)
         self.scheduler.add(seq)
 
 
@@ -324,7 +378,19 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
         stream_callback=None,
+        images: list | None = None,
     ) -> list[str]:
+        """Generate completions for a batch of prompts.
+
+        Args:
+            prompts: List of text prompts or pre-tokenized token id lists.
+            sampling_params: Sampling parameters (single or per-prompt).
+            use_tqdm: Show progress bar.
+            stream_callback: Optional callback for streaming tokens.
+            images: Optional list of image inputs for VLM mode. Each element
+                    corresponds to one prompt and can be a single PIL Image
+                    or a list of PIL Images.
+        """
         for k in METRICS:
             METRICS[k] = [] if isinstance(METRICS[k], list) else 0
 
@@ -333,8 +399,11 @@ class LLMEngine:
                         desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
-        for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
+        if images is None:
+            images = [None] * len(prompts)
+        for prompt, sp, img in zip(prompts, sampling_params, images):
+            img_list = [img] if img is not None and not isinstance(img, list) else img
+            self.add_request(prompt, sp, images=img_list)
 
         outputs = {}
         inference_step = self.create_inference_step(self.config)
