@@ -189,6 +189,12 @@ def load_safetensors_model(model: nn.Module, path: str, packed_modules_mapping: 
     for file in tqdm(safetensor_files, desc="Loading model files"):
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
+                # Skip vision encoder weights if the model doesn't have a visual module
+                # (e.g. loading a VLM checkpoint but only using the LM part)
+                if weight_name.startswith("visual."):
+                    if not any(n.startswith("visual.") for n, _ in model.named_parameters()):
+                        continue
+
                 for k in packed_modules_mapping:
                     if k in weight_name:
                         v, shard_id = packed_modules_mapping[k]
@@ -198,12 +204,16 @@ def load_safetensors_model(model: nn.Module, path: str, packed_modules_mapping: 
                         weight_loader(param, f.get_tensor(weight_name), shard_id)
                         break
                 else:
-                    param = model.get_parameter(weight_name)
+                    try:
+                        param = model.get_parameter(weight_name)
+                    except AttributeError:
+                        # Skip weights not present in model (e.g. vision weights when not VLM)
+                        continue
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, f.get_tensor(weight_name))
 
 
-def load_model(model: nn.Module, path: str, target_path: str = None, target_hidden_size: int = None):
+def load_model(model: nn.Module, path: str, target_path: str = None, target_hidden_size: int = None, lora_path: str = None):
     print(f"[load_model] loading model from {path}")
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     
@@ -214,5 +224,10 @@ def load_model(model: nn.Module, path: str, target_path: str = None, target_hidd
         load_eagle_model(model, path, packed_modules_mapping, target_path=target_path, target_hidden_size=target_hidden_size)
     else:
         load_safetensors_model(model, path, packed_modules_mapping)
+
+    # Apply LoRA adapter weights if provided
+    if lora_path is not None:
+        from ssd.utils.lora import merge_lora_weights
+        merge_lora_weights(model, lora_path, packed_modules_mapping)
 
     print(f"[load_model] finished loading model from {path}")

@@ -9,6 +9,7 @@ from ssd.layers.layernorm import RMSHeadNorm, RMSDNorm
 from ssd.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from ssd.layers.rotary_embedding import get_rope
 from ssd.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from ssd.models.qwen3_vision import Qwen3VisionEncoder
 
 
 class Qwen3Attention(nn.Module):
@@ -253,8 +254,13 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        image_embeds: torch.Tensor | None = None,
+        image_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)  # torch.Size([4096, 2560]) always through residual stream 
+        hidden_states = self.embed_tokens(input_ids)  # torch.Size([4096, 2560]) always through residual stream
+        # Replace image placeholder token embeddings with vision encoder outputs
+        if image_embeds is not None and image_mask is not None:
+            hidden_states[image_mask] = image_embeds.to(hidden_states.dtype)
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
@@ -282,6 +288,7 @@ class Qwen3ForCausalLM(nn.Module):
         draft_async: bool = False,
         tp_group: dist.ProcessGroup | None = None,
         tp_size: int = 1,
+        is_vlm: bool = False,
     ) -> None:
         super().__init__()
 
@@ -290,11 +297,12 @@ class Qwen3ForCausalLM(nn.Module):
         self.draft_async = draft_async
         self.tp_group = tp_group
         self.tp_size = tp_size
+        self.is_vlm = is_vlm
         
         assert not use_eagle, "ERROR in Qwen3ForCausalLM: use_eagle not supported for Qwen3"
         assert not (tp_group is None and self.tp_size > 1), "ERROR in Qwen3ForCausalLM: tp_group is None and tp_size > 1"
 
-        print(f'Starting Qwen3ForCausalLM init, draft={draft}, speculate={speculate}, spec_k={spec_k}')
+        print(f'Starting Qwen3ForCausalLM init, draft={draft}, speculate={speculate}, spec_k={spec_k}, is_vlm={is_vlm}')
         self.model = Qwen3Model(config, draft, speculate, spec_k, async_fan_out, draft_async, tp_group=tp_group, tp_size=self.tp_size)
         self.async_fan_out = async_fan_out
         self.lm_head = ParallelLMHead(
@@ -306,14 +314,52 @@ class Qwen3ForCausalLM(nn.Module):
         )
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
+
+        # Vision encoder for VLM mode
+        self.visual = None
+        if is_vlm:
+            vision_config = getattr(config, "vision_config", None)
+            if vision_config is not None:
+                self.visual = Qwen3VisionEncoder(
+                    config, dtype=getattr(config, "torch_dtype", torch.bfloat16)
+                )
+                print(f'[VLM] Vision encoder initialized')
+            else:
+                print(f'[VLM] Warning: is_vlm=True but no vision_config found in model config')
+
         print(f'Finishing Qwen3ForCausalLM init, draft={draft}, speculate={speculate}, spec_k={spec_k}') 
+
+    def encode_images(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the vision encoder to get image embeddings.
+
+        Args:
+            pixel_values: Preprocessed image pixels from the VLM processor.
+            image_grid_thw: [num_images, 3] tensor of (t, h, w) grid sizes.
+
+        Returns:
+            image_embeds: [total_image_tokens, hidden_size] tensor.
+        """
+        assert self.visual is not None, "encode_images called but no vision encoder"
+        return self.visual(pixel_values, image_grid_thw)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        image_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions)
+        # Encode images if VLM inputs are provided
+        image_embeds = None
+        if self.is_vlm and pixel_values is not None and image_grid_thw is not None:
+            image_embeds = self.encode_images(pixel_values, image_grid_thw)
+
+        hidden_states = self.model(input_ids, positions, image_embeds=image_embeds, image_mask=image_mask)
         return hidden_states
 
     def compute_logits(

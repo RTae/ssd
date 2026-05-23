@@ -243,6 +243,9 @@ class ModelRunner:
         if model_class == Eagle3DraftForCausalLM:
             kwargs['d_model_target'] = config.d_model_target
             kwargs['debug_mode'] = config.debug_mode
+
+        if model_class == Qwen3ForCausalLM and getattr(config, 'is_vlm', False):
+            kwargs['is_vlm'] = True
             
         self.model = model_class(**kwargs)
 
@@ -253,7 +256,8 @@ class ModelRunner:
         # Pass tokenizer_path as target_path if it's available (mostly for Eagle draft)
         target_path = getattr(config, 'tokenizer_path', None)
         target_hidden_size = getattr(config, 'd_model_target', None)
-        load_model(self.model, config.model, target_path=target_path, target_hidden_size=target_hidden_size)
+        lora_path = getattr(config, 'lora_path', None)
+        load_model(self.model, config.model, target_path=target_path, target_hidden_size=target_hidden_size, lora_path=lora_path)
         
         if config.draft_async:  # move this here so we don't get a timeout waiting for draft rank while load_model happens?
             self.async_pg = dist.new_group(ranks=[0, self.draft_rank])
@@ -592,7 +596,7 @@ class ModelRunner:
         )
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, last_only: bool = True, tree_decode_step: int = -1, cache_hits: torch.Tensor | None = None, hidden_states: torch.Tensor | None = None):
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, last_only: bool = True, tree_decode_step: int = -1, cache_hits: torch.Tensor | None = None, hidden_states: torch.Tensor | None = None, vlm_kwargs: dict | None = None):
         is_tree_decode = self.is_draft and self.config.draft_async and tree_decode_step >= 0
         is_mq_kp1 = self.config.speculate and not last_only
         spec_and_dec = not is_prefill and self.config.speculate
@@ -614,8 +618,10 @@ class ModelRunner:
                     outputs, eagle_acts = self.model(input_ids, positions) # target fwd when eagle enabled hooks into activations for eagle conditioning
                     logits = self.model.compute_logits(outputs, last_only)
                     return logits, eagle_acts  # return eagle_acts as conditioning vector for draft
-            else: 
-                outputs = self.model(input_ids, positions)
+            else:
+                # Pass VLM kwargs (pixel_values, image_grid_thw, image_mask) during prefill
+                fwd_kwargs = vlm_kwargs if (vlm_kwargs and is_prefill) else {}
+                outputs = self.model(input_ids, positions, **fwd_kwargs)
                 logits = self.model.compute_logits(outputs, last_only)
                 return logits 
 
@@ -654,13 +660,25 @@ class ModelRunner:
             torch.cuda.synchronize()
             _r1 = time.perf_counter()
 
+        # Collect VLM inputs from sequences during prefill
+        vlm_kwargs = {}
+        if is_prefill and getattr(self.config, 'is_vlm', False):
+            vlm_kwargs = self._collect_vlm_inputs(seqs)
+
         # Handle EAGLE returning (logits, conditioning_vector for next iter)
         conditioning = None
         if self.config.use_eagle:
             logits, conditioning = self.run_model(
                 input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
         else:
-            logits = self.run_model(input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
+            logits = self.run_model(input_ids, positions, is_prefill, last_only, hidden_states=hidden_states, vlm_kwargs=vlm_kwargs)
+
+        # Clear VLM data from sequences after prefill (no longer needed)
+        if is_prefill and vlm_kwargs:
+            for seq in seqs:
+                seq.pixel_values = None
+                seq.image_grid_thw = None
+                seq.image_mask = None
 
         if _pt:
             torch.cuda.synchronize()
@@ -679,4 +697,44 @@ class ModelRunner:
                 return logits, conditioning
             return logits
     
+    def _collect_vlm_inputs(self, seqs: list[Sequence]) -> dict:
+        """Collect VLM (vision) inputs from sequences for prefill.
+
+        Concatenates pixel_values, image_grid_thw, and image_mask from all
+        sequences in the batch. Returns an empty dict if no VLM data is present.
+        """
+        all_pixel_values = []
+        all_image_grid_thw = []
+        all_image_masks = []
+        has_vlm = False
+
+        for seq in seqs:
+            if seq.pixel_values is not None:
+                has_vlm = True
+                pv = seq.pixel_values
+                if pv.device != self.device:
+                    pv = pv.to(self.device)
+                all_pixel_values.append(pv)
+            if seq.image_grid_thw is not None:
+                thw = seq.image_grid_thw
+                if thw.device != self.device:
+                    thw = thw.to(self.device)
+                all_image_grid_thw.append(thw)
+            if seq.image_mask is not None:
+                mask = seq.image_mask
+                if mask.device != self.device:
+                    mask = mask.to(self.device)
+                all_image_masks.append(mask)
+
+        if not has_vlm:
+            return {}
+
+        vlm_kwargs = {}
+        if all_pixel_values:
+            vlm_kwargs["pixel_values"] = torch.cat(all_pixel_values, dim=0)
+        if all_image_grid_thw:
+            vlm_kwargs["image_grid_thw"] = torch.cat(all_image_grid_thw, dim=0)
+        if all_image_masks:
+            vlm_kwargs["image_mask"] = torch.cat(all_image_masks, dim=0)
+        return vlm_kwargs
 

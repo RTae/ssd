@@ -22,9 +22,11 @@ class Sequence:
         'num_draft_cached_tokens', 'temperature', 'draft_temperature', 'max_new_tokens',
         'ignore_eos', 'recovery_token_id', 'last_target_hidden_state',
         'extend_eagle_acts', 'extend_token_ids', 'extend_count',
+        'pixel_values', 'image_grid_thw', 'image_mask',
     ]
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(self, token_ids: list[int], sampling_params = SamplingParams(),
+                 pixel_values=None, image_grid_thw=None, image_mask=None):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
@@ -49,6 +51,11 @@ class Sequence:
         self.extend_eagle_acts = None
         self.extend_token_ids = None
         self.extend_count = 0
+
+        # VLM fields — only used during prefill, cleared after first forward pass
+        self.pixel_values = pixel_values
+        self.image_grid_thw = image_grid_thw
+        self.image_mask = image_mask
 
     def __len__(self):
         return self.num_tokens

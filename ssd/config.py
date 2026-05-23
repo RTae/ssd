@@ -39,6 +39,13 @@ class Config:
     d_model_target: int | None = None
     tokenizer_path: str | None = None
 
+    # LoRA adapter paths
+    lora_path: str | None = None
+    draft_lora_path: str | None = None
+
+    # VLM (Vision Language Model)
+    is_vlm: bool = False
+
     # Debugging
     verbose: bool = False 
     debug_mode: bool = False 

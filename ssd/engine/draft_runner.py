@@ -28,6 +28,7 @@ class DraftRunner(ModelRunner):
             tokenizer_path=cfg.model if cfg.use_eagle else None,
             d_model_target=cfg.hf_config.hidden_size if cfg.use_eagle and cfg.hf_config else None,
             enforce_eager=cfg.enforce_eager,
+            lora_path=cfg.draft_lora_path,
         )
         return draft_cfg
 
