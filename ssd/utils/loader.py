@@ -203,7 +203,7 @@ def load_safetensors_model(model: nn.Module, path: str, packed_modules_mapping: 
                     weight_loader(param, f.get_tensor(weight_name))
 
 
-def load_model(model: nn.Module, path: str, target_path: str = None, target_hidden_size: int = None):
+def load_model(model: nn.Module, path: str, target_path: str = None, target_hidden_size: int = None, lora_path: str = None):
     print(f"[load_model] loading model from {path}")
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     
@@ -214,5 +214,10 @@ def load_model(model: nn.Module, path: str, target_path: str = None, target_hidd
         load_eagle_model(model, path, packed_modules_mapping, target_path=target_path, target_hidden_size=target_hidden_size)
     else:
         load_safetensors_model(model, path, packed_modules_mapping)
+
+    # Apply LoRA adapter weights if provided
+    if lora_path is not None:
+        from ssd.utils.lora import merge_lora_weights
+        merge_lora_weights(model, lora_path, packed_modules_mapping)
 
     print(f"[load_model] finished loading model from {path}")
